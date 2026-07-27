@@ -178,6 +178,26 @@ payout by going silent. The one asymmetric power either side has is
 monotonic cost, not a permission gate, and capped at one contest per deal so
 it can't be used to stall indefinitely.
 
+### Access control — who may call what
+
+| Method | Who may call it | Why |
+|---|---|---|
+| `create_deal` | Anyone (becomes the buyer) | Permissionless entry point — no gatekeeping on who can propose a trade |
+| `cancel_deal` | Buyer only | Only the party whose funds are at risk pre-acceptance should be able to pull them back |
+| `accept_deal` | The named seller only | Nobody else can commit a third party's goods/bond to a trade |
+| `submit_delivery_evidence` | Buyer only | Only the party holding the goods can attest to what arrived |
+| `contest_verdict` | Buyer or seller only | Only the two counterparties have standing to dispute the verdict that pays them |
+| `timeout_unaccepted_reclaim` | Anyone (permissionless) | Recovers the buyer's own funds; nobody's interest is harmed by a bystander triggering it early-safe logic, so there's no reason to gate it |
+| `timeout_undelivered_reclaim` | Anyone (permissionless) | Same reasoning — funds always route to the buyer regardless of caller |
+| `check_delivery_status` | Anyone (permissionless) | A read-only-in-effect nondet call — it records a fact, moves no funds, so gating it would only slow resolution down |
+| `claim_via_tracking_confirmation` | Anyone (permissionless) | Funds always route to `deal.seller` regardless of who calls it, so restricting the caller adds no safety, only friction |
+| `resolve_condition` | Anyone (permissionless) | The verdict is validator-decided, not caller-decided, and funds don't move until `finalize_deal` — so letting anyone trigger adjudication just keeps the deal from stalling on one party's inaction |
+| `resolve_contest` | Anyone (permissionless) | Same reasoning as `resolve_condition` — the outcome is consensus-decided, not caller-decided |
+| `finalize_deal` | Anyone (permissionless) | Funds route strictly by the already-recorded verdict; the caller has no influence over the amount or recipient |
+| `force_refund_undetermined` | Anyone (permissionless) | A safety valve that always refunds the buyer — gating it would only give one party the power to withhold the buyer's own refund |
+
+The pattern throughout: **any call that could bias who gets paid is restricted to the party who bears that specific risk; any call whose outcome is already fixed by prior consensus or by the deal's own rules is left permissionless**, so neither party can stall the other by refusing to submit a transaction.
+
 ## Safety properties (each backed by a named test)
 
 - Double-spend structurally impossible: every payout path zeroes its ledger
@@ -323,6 +343,111 @@ transactions):
 - Every deterministic write across all of the above reached **5/5 AGREE**
   except one nondet round that reached quorum at 4 AGREE + 1 IDLE — both are
   documented StudioNet behaviors, not faults.
+
+## Errors encountered while writing and fixing this contract
+
+These are real failures hit during development, in the order they surfaced,
+kept here rather than quietly edited away — each one changed something
+either in the code or in how it was tested.
+
+1. **`genvm-lint` error E022 — `Method '_fetch_image' must have 'self' as
+   first parameter`.** Several helper methods (`_addr_eq`,
+   `_fetch_image`, `_fetch_tracking_text`, `_exec_prompt_json`,
+   `_terminal_status_for_band`) were written as `@staticmethod`, which felt
+   natural since they don't touch `self.<storage>`. GenVM's contract methods
+   are not allowed to be static at all — every method, even a pure helper,
+   must take `self`. **Why**: the linter enforces this because GenVM's
+   method-dispatch machinery always passes `self` through; a static method
+   breaks that calling convention at the runtime level, not just a style
+   preference. Fix: dropped every `@staticmethod` decorator and added
+   `self` as the first parameter, even where it went unused.
+
+2. **`genvm-lint` error E010 — `gl.nondet.* call ... not reachable from
+   equivalence principle block`.** The first version of the fetch logic put
+   `gl.nondet.web.get(...)` inside a small private method
+   (`_fetch_image_or_none`), called from a second method
+   (`_run_condition_adjudication`), called from the `leader()` closure
+   passed to `gl.eq_principle.prompt_comparative`. **Why**: the linter's
+   static reachability analysis only walks one call hop deep from the
+   function actually handed to `prompt_comparative` — a nondet call buried
+   two methods down isn't provably reachable from the equivalence-principle
+   block, so it's flagged as a potential rule violation even though it *is*
+   reachable at runtime. Fix: inlined the fetch bytes and the
+   `exec_prompt` call directly into `_run_condition_adjudication` and
+   `_run_tracking_check` — the two methods `leader()` calls directly — so
+   every `gl.nondet.*` call is at most one hop from the closure.
+
+3. **The same E010 error persisted even after inlining, but only for the
+   nested closures — traced to `contract = self` inside the outer method.**
+   The outer method did `contract = self` and then `leader()` called
+   `contract._run_condition_adjudication(...)`. **Why**: the linter's
+   pattern match for "is this call reachable from the leader" looks for the
+   literal `self.` (or the exact identifier the outer function's first
+   parameter is bound to) — it does not resolve aliases like
+   `contract = self` before pattern-matching. It never actually needed
+   fixing at the logic level: Python closures already capture `self` from
+   the enclosing method without any alias, so it was pure ceremony that
+   also happened to defeat the linter. Fix: removed the alias entirely and
+   referenced `self` directly inside `leader()`, matching the pattern used
+   by this repo's sibling contracts (Event-Weaver, Meme-Olympics).
+
+4. **`genvm-lint` error E018 — `TreeMap key for 'deals' must be Comparable
+   ... got 'u64'`.** Deal ids and activity-log keys were originally typed
+   `TreeMap[u64, Deal]`. **Why**: GenVM's storage layer only accepts a
+   specific set of key types for `TreeMap` (`str`, `Address`, `u32`, and a
+   few others) — `u64` is a valid *field* type inside a stored dataclass,
+   but not a valid *map key* type. Fix: switched every deal-id key (and the
+   `Deal.id` field itself, for consistency) from `u64` to `u32`; ids stay
+   well within `u32` range for any realistic deal volume.
+
+5. **`UnicodeEncodeError: 'ascii' codec can't encode character '—' in
+   position 1087` when fetching the contract's schema** (via
+   `gltest`'s `get_contract_schema_for_code`, both the default and hosted
+   Studio clients). The contract's comments and docstrings used em-dashes
+   (`—`) and ellipsis characters (`…`) throughout, matching the prose style
+   used elsewhere in this write-up. **Why**: the schema-fetch client
+   encodes the contract source as ASCII before sending it to be compiled
+   for schema extraction, and neither client falls back to UTF-8 on a
+   non-ASCII character — it raises instead of degrading. This is very
+   likely the exact class of "could not load schema" failure that's easy to
+   hit by pasting prose with smart punctuation into a contract file. Fix:
+   stripped every non-ASCII character from both `contracts/delivery_vault.py`
+   and `examples/marketplace_board.py` (em-dash → hyphen, ellipsis → three
+   periods) and verified programmatically that both files contain zero
+   characters above codepoint 127.
+
+6. **CLI `genlayer write ... --fee-value <wei>` does not attach
+   `gl.message.value`.** An early attempt to fund `create_deal` via the
+   `genlayer` CLI used `--fee-value 1000000000000000000`, expecting it to
+   arrive as the payable value. The transaction reported `ACCEPTED` with
+   5/5 validator agreement, but `get_deal_count()` stayed at `0` afterward.
+   **Why**: `--fee-value` sets the transaction's *fee deposit* (gas-like
+   allocation), not the payable message value — there is currently no CLI
+   flag for attaching native value to a write. The 5/5 "ACCEPTED" consensus
+   was validators unanimously agreeing that the call reverted with
+   `EXPECTED: attach the agreed price as value` (visible in
+   `genlayer receipt <tx> --stdout --stderr`) — a reverted call is still a
+   valid, agreed-upon outcome, so it "succeeds" at the consensus layer while
+   doing nothing to contract state. Fix: switched all value-carrying calls
+   to `gltest`'s Python client (`ContractFunction.transact(value=...)`),
+   which does attach real `gl.message.value`, and used that for every
+   payable call in the integration tests.
+
+7. **`INVALID_IMAGE` from the model provider, and separately a verdict
+   claiming "no image content" was available, both against
+   `picsum.photos` listing/delivery photo URLs.** **Why**: `picsum.photos`
+   serves images via an HTTP 302 redirect (empty body, `Location` header)
+   rather than the image bytes directly. This is a genuine, still-open
+   flakiness in how the evidence layer surfaces fetched bytes to the vision
+   model when the source redirects — not a bug in this contract's own fetch
+   code, which is exercised and passing in 57 direct tests with mocked
+   image bytes, and which produced a correct, confident `MATCH` verdict
+   live on StudioNet once pointed at a non-redirecting URL
+   (`httpbin.org/image/jpeg`) — including one run that survived a full
+   bonded contest and adversarial re-adjudication and still converged on
+   `MATCH`. This one was **not fixed in the contract**; it's a constraint on
+   evidence-source selection, documented in "The honest limits" below
+   rather than papered over.
 
 ## The honest limits
 
