@@ -9,6 +9,20 @@ classifieds app, or a resale platform imports this to fund a trade without
 either party (or the platform) ever being the one who decides "does this
 match what was promised."
 
+**Contents**: [The problem](#the-problem) ·
+[Why this needs GenLayer](#why-this-needs-genlayer) ·
+[Why this isn't excluded](#why-this-isnt-one-of-the-excluded-patterns) ·
+[Design](#design) ·
+[Fixes from review](#fixes-made-in-response-to-external-review) ·
+[Safety properties](#safety-properties-each-backed-by-a-named-test) ·
+[Reusability](#reusability) ·
+[Storage layout & constants](#storage-layout--constants) ·
+[Full method reference](#full-method-reference) ·
+[Development](#development) · [Status](#status) ·
+[Measured on live consensus](#measured-on-live-consensus) ·
+[Errors encountered](#errors-encountered-while-writing-and-fixing-this-contract) ·
+[Honest limits](#the-honest-limits)
+
 ## The problem
 
 Alice lists a couch with a photo. Bob sends her the money. The couch arrives
@@ -242,7 +256,10 @@ The pattern throughout: **any call that could bias who gets paid is restricted t
 ## Fixes made in response to external review
 
 A team review of the first submission raised two findings. Both are fixed,
-not just documented around:
+not just documented around. **See [docs/REVIEW.md](docs/REVIEW.md) for the
+full walkthrough** — the verbatim review comment, before/after code for
+both fixes, why each was wrong, and exactly how each was verified. The
+summary:
 
 1. **"The escrow payout is not fully bound by validator consensus: two
    minor-discrepancy results up to 1,500 basis points apart are treated as
@@ -348,21 +365,93 @@ The same primitive, parameterized only by strings and timestamps, covers:
 | Rental-deposit return condition | roles reversed: "seller" = renter posting a damage bond |
 | B2B sample-vs-bulk-shipment QA | `listing_photo_url` = approved sample photo |
 
-## API reference
+## Storage layout & constants
 
-**Writes**: `create_deal`, `cancel_deal`, `accept_deal`,
-`timeout_unaccepted_reclaim`, `submit_delivery_evidence`,
-`timeout_undelivered_reclaim`, `check_delivery_status`,
-`claim_via_tracking_confirmation`, `resolve_condition`,
-`force_refund_undetermined`, `finalize_deal`, `contest_verdict`,
-`resolve_contest`.
+### `Deal` (one per trade, keyed by `u32` id in `TreeMap[u32, Deal]`)
 
-**Views**: `get_deal`, `get_deal_summary`, `get_deal_count`,
-`get_party_deal_ids`, `get_activity`, `get_platform_stats`, `get_config`.
+| Field | Type | Purpose |
+|---|---|---|
+| `id` | `u32` | Deal id (matches the `TreeMap` key) |
+| `buyer` / `seller` | `Address` | The two counterparties |
+| `item_title` / `item_description` | `str` | Listing metadata (capped at 160 / 2000 chars) |
+| `listing_photo_url` / `tracking_url` | `str` | Seller's promised-condition photo; carrier tracking page (capped at 500 chars each) |
+| `delivery_photo_url` | `str` | Buyer's arrival photo; empty until `submit_delivery_evidence` |
+| `status` | `u8` | One of the 15 lifecycle statuses below |
+| `created_ts` / `ship_by_ts` / `deliver_by_ts` | `u64` | Trusted-clock creation time; caller-proposed deal terms |
+| `price_wei` / `price_deposited_wei` | `str` (wei) | Agreed term vs. actual escrow ledger — payouts read only the `_deposited_wei` field, zeroed before every transfer |
+| `seller_bond_wei` / `seller_bond_deposited_wei` | `str` (wei) | Same term/ledger split for the seller's optional performance bond |
+| `contest_bond_wei` / `contest_bond_deposited_wei` | `str` (wei) | Same split for a posted contest bond |
+| `contester` | `str` | Hex address of whoever contested; `""` if never contested |
+| `tracking_status` / `tracking_checked` | `u8` / `bool` | Last tracking classification and whether it's ever been run |
+| `verdict_band` / `seller_payout_bps` / `verdict_reasoning` | `u8` / `u32` / `str` | The recorded (pre-finalization) verdict |
+| `final_band` / `final_seller_payout_bps` | `u8` / `u32` | The verdict actually paid out (may differ from the recorded one if a contest overturns it) |
+| `contest_outcome` | `str` | `""` / `"UPHELD"` / `"OVERTURNED"` |
+| `resolve_attempts` / `contest_count` | `u32` | Retry counters |
+| `resolved_ts` / `finalized_ts` | `u64` | Trusted-clock timestamps of the recorded verdict and of finalization |
 
-Full parameter signatures are in the on-chain schema (`genlayer schema
-<address>`) and mirrored in `contracts/delivery_vault.py`'s method
-definitions.
+### Enums (stored as `u8`, exposed as strings on every view)
+
+| Statuses (`STATUS_*`) | Verdict bands (`BAND_*`) | Tracking (`TRACK_*`) |
+|---|---|---|
+| `CREATED`, `ACCEPTED`, `DELIVERY_SUBMITTED`, `UNDETERMINED`, `VERDICT_PENDING`, `CONTESTED`, `FINALIZED_MATCH`, `FINALIZED_MINOR_DISCREPANCY`, `FINALIZED_MAJOR_DISCREPANCY`, `FINALIZED_NOT_RECEIVED`, `FINALIZED_TRACKING_CLAIM`, `CANCELLED`, `TIMEOUT_UNACCEPTED`, `TIMEOUT_UNDELIVERED`, `TIMEOUT_UNDETERMINED_REFUND` | `NONE`, `MATCH`, `MINOR_DISCREPANCY`, `MAJOR_DISCREPANCY`, `NOT_RECEIVED` | `UNKNOWN`, `IN_TRANSIT`, `DELIVERED`, `EXCEPTION` |
+
+### Immutable constants (no setter anywhere — see [Trust model](#trust-model))
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `CONTEST_BOND_BPS` | 1500 (15%) | Contest bond, as a fraction of the price |
+| `CONTEST_WINDOW_SECONDS` | 172800 (48h) | Window to contest a recorded verdict before `finalize_deal` may run |
+| `SELLER_TRACKING_CLAIM_GRACE_SECONDS` | 259200 (3d) | Past `deliver_by_ts`, before a seller may claim via tracking proof |
+| `DELIVER_GRACE_SECONDS` | 604800 (7d) | Past `deliver_by_ts`, before a buyer forfeits the delivery-evidence window |
+| `UNDETERMINED_GRACE_SECONDS` | 259200 (3d) | Past the last adjudication attempt, before a stuck deal force-refunds |
+| `MAX_RESOLVE_ATTEMPTS` | 5 | Adjudication retries before `force_refund_undetermined` becomes callable |
+| `BPS_BUCKET` | 500 (5pp) | Granularity `seller_payout_bps` is rounded to before any comparison |
+
+Other hard limits (`MAX_TITLE_LEN=160`, `MAX_DESCRIPTION_LEN=2000`,
+`MAX_URL_LEN=500`, `MAX_REASONING_STORED=1200`, `MAX_EVIDENCE_EXCERPT=6000`,
+`MAX_ACTIVITY_NOTE_LEN=200`) are sanity rails on storage, not economic
+parameters. `get_config()` returns every timing/bond constant on-chain.
+
+## Full method reference
+
+Every parameter, in call order, plus payability and access control. `deal_id`
+is always the first argument after `self`. No method anywhere takes a
+caller-supplied "current time" — see
+[Trusted time](#trusted-time-not-a-caller-supplied-argument).
+
+### Writes
+
+| Method | Params (after `deal_id` where applicable) | Payable | Who may call |
+|---|---|---|---|
+| `create_deal` | `seller, item_title, item_description, listing_photo_url, tracking_url, ship_by_ts, deliver_by_ts` → returns `int` (deal id) | Yes — value becomes the escrowed price | Anyone (becomes the buyer) |
+| `cancel_deal` | — | No | Buyer only, pre-acceptance |
+| `accept_deal` | — | Yes — value becomes the seller's optional bond (0 valid) | The named seller only |
+| `timeout_unaccepted_reclaim` | — | No | Anyone (permissionless) |
+| `submit_delivery_evidence` | `delivery_photo_url` | No | Buyer only |
+| `timeout_undelivered_reclaim` | — | No | Anyone (permissionless) |
+| `check_delivery_status` | — → returns `dict {status, reasoning}` | No | Anyone (permissionless) |
+| `claim_via_tracking_confirmation` | — | No | Anyone (permissionless; funds always route to the seller) |
+| `resolve_condition` | — → returns `dict` (status/band/bps) | No | Anyone (permissionless) |
+| `force_refund_undetermined` | — | No | Anyone (permissionless) |
+| `finalize_deal` | — | No | Anyone (permissionless) |
+| `contest_verdict` | — | Yes — must equal exactly `price_wei * CONTEST_BOND_BPS / 10000` | Buyer or seller only |
+| `resolve_contest` | — → returns `dict {outcome, final_band, final_seller_payout_bps}` | No | Anyone (permissionless) |
+
+### Views
+
+| Method | Params | Returns |
+|---|---|---|
+| `get_deal` | `deal_id` | Every field of `Deal`, enums as strings |
+| `get_deal_summary` | `deal_id` | `{id, status, price_wei, final_band}` — cheap poll |
+| `get_deal_count` | — | `int` |
+| `get_party_deal_ids` | `address` | `list[int]` of deal ids the address is buyer or seller on |
+| `get_activity` | `deal_id, offset=0, limit=25` | Paginated, newest-first activity log |
+| `get_platform_stats` | — | `{total_deals, total_volume_wei, total_finalized, total_contests}` |
+| `get_config` | — | Every constant from the table above |
+
+Full parameter *types* are also in the on-chain schema (`genlayer schema
+<address>`), which will match this table exactly since it's generated from
+the same source file.
 
 ## Development
 
@@ -553,7 +642,7 @@ either in the code or in how it was tested.
   in the contest-ladder run *did* produce a correct, confident `MATCH`
   verdict — so this reads as real flakiness in how the current pinned runner
   version surfaces fetched image bytes to the vision model, not a bug in the
-  contract's fetch-and-forward logic (which is exercised and passing in 57
+  contract's fetch-and-forward logic (which is exercised and passing in 58
   direct tests with mocked bytes). Reusers should serve evidence photos from
   a URL that returns image bytes directly with no redirect chain, and should
   expect to budget for at least one retry.
