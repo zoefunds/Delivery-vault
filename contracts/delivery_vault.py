@@ -1,6 +1,7 @@
 # v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
+import datetime
 import json
 import re
 from dataclasses import dataclass
@@ -420,6 +421,15 @@ class DeliveryVault(gl.Contract):
     def _send_native(self, recipient: Address, amount: int) -> None:
         _send_gen(recipient, amount)
 
+    def _now_ts(self) -> int:
+        """Authenticated, consensus-agreed clock. GenVM patches
+        datetime.now() to the network's block time, which every validator
+        computes identically -- it is never read from a caller-supplied
+        argument or calldata, so it cannot be spoofed by a transaction
+        sender to fabricate a future or past time and force a timeout,
+        grace window, or contest deadline to fire early or late."""
+        return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
     # ------------------------------------------------------------------
     #  Condition adjudication - image evidence, comparative equivalence.
     # ------------------------------------------------------------------
@@ -531,6 +541,25 @@ Return ONLY a JSON object exactly like:
             raise gl.vm.UserError(ERR_LLM + f"exec_prompt failed: {exc}")
         return _parse_condition_verdict(raw)
 
+    def _handle_nondet_leader_error(self, leaders_res, leader_fn) -> bool:
+        """Canonical validator-side comparison when the leader errored.
+        Deterministic errors must match exactly; transient errors agree if
+        both sides are transient; LLM/unknown errors force disagreement so
+        consensus rotates the leader instead of persisting garbage."""
+        leader_msg = getattr(leaders_res, "message", "") or ""
+        try:
+            leader_fn()
+            return False  # leader failed, validator succeeded -> disagree
+        except gl.vm.UserError as exc:
+            validator_msg = getattr(exc, "message", None) or str(exc)
+            if validator_msg.startswith(ERR_EXPECTED) or validator_msg.startswith(ERR_EXTERNAL):
+                return validator_msg == leader_msg
+            if validator_msg.startswith(ERR_TRANSIENT) and leader_msg.startswith(ERR_TRANSIENT):
+                return True
+            return False
+        except Exception:
+            return False
+
     def _adjudicate_condition_nondet(
         self,
         listing_photo_url: str,
@@ -540,7 +569,20 @@ Return ONLY a JSON object exactly like:
         tracking_note: str,
         adversarial: bool,
     ) -> dict:
-        def leader() -> str:
+        """Consensus over the condition verdict, code-enforced rather than
+        left to an LLM's interpretation of a natural-language tolerance.
+        The band must match EXACTLY, and when the band is
+        MINOR_DISCREPANCY, the bucketed seller_payout_bps -- the exact
+        figure real money is later split by -- must ALSO match exactly
+        between the leader and each validator's own independent
+        re-derivation. There is no numeric "close enough" here: because
+        _parse_condition_verdict already rounds seller_payout_bps to the
+        nearest 500, two independent runs either land in the same discrete
+        bucket (agree) or they don't (disagree, leader rotates) -- the
+        settlement amount is never just whatever the leader happened to
+        propose."""
+
+        def leader_fn() -> dict:
             verdict = self._run_condition_adjudication(
                 listing_photo_url,
                 delivery_photo_url,
@@ -549,31 +591,40 @@ Return ONLY a JSON object exactly like:
                 tracking_note,
                 adversarial,
             )
-            return json.dumps(
-                {
-                    "band": BAND_NAMES[verdict["band"]],
-                    "seller_payout_bps": verdict["seller_payout_bps"],
-                    "reasoning": verdict["reasoning"],
-                },
-                sort_keys=True,
-            )
+            return {
+                "band": BAND_NAMES[verdict["band"]],
+                "seller_payout_bps": verdict["seller_payout_bps"],
+                "reasoning": verdict["reasoning"],
+            }
 
-        principle = (
-            "Both results are JSON verdicts about whether a physical item's "
-            "delivered condition matches its promised listing condition, "
-            "based on the same listing photo and delivery photo. Treat them "
-            "as equivalent if they agree on the 'band' value (MATCH, "
-            "MINOR_DISCREPANCY, MAJOR_DISCREPANCY, or NOT_RECEIVED) AND, "
-            "when the band is MINOR_DISCREPANCY, their 'seller_payout_bps' "
-            "values are within 1500 of each other. Differences in wording of "
-            "'reasoning', which discrepancy is named first, formatting, or "
-            "key order are irrelevant. A different band, or a materially "
-            "different payout split outside that tolerance, is NOT "
-            "equivalent."
-        )
+        def validator_fn(leaders_res: gl.vm.Result) -> bool:
+            if not isinstance(leaders_res, gl.vm.Return):
+                return self._handle_nondet_leader_error(leaders_res, leader_fn)
+            leader_out = leaders_res.calldata
+            if not isinstance(leader_out, dict):
+                return False
+            try:
+                mine = leader_fn()
+            except gl.vm.UserError as exc:
+                msg = getattr(exc, "message", None) or str(exc)
+                return msg.startswith(ERR_TRANSIENT)
+            except Exception:
+                return False
 
-        raw_result = gl.eq_principle.prompt_comparative(leader, principle)
-        return _parse_condition_verdict(raw_result)
+            leader_band = str(leader_out.get("band", ""))
+            if leader_band not in BAND_NAMES.values() or leader_band != mine["band"]:
+                return False
+            if leader_band == BAND_NAMES[BAND_MINOR_DISCREPANCY]:
+                try:
+                    leader_bps = int(leader_out.get("seller_payout_bps", -1))
+                except (ValueError, TypeError):
+                    return False
+                if leader_bps != mine["seller_payout_bps"]:
+                    return False
+            return True
+
+        result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        return _parse_condition_verdict(result)
 
     # ------------------------------------------------------------------
     #  Tracking-page adjudication - independent web-fetch surface.
@@ -634,25 +685,33 @@ Return ONLY a JSON object exactly like:
         return _parse_tracking_verdict(raw)
 
     def _check_tracking_nondet(self, tracking_url: str) -> dict:
-        def leader() -> str:
+        """Code-enforced exact status match -- this classification directly
+        gates a full payout in `claim_via_tracking_confirmation`, so it gets
+        the same run_nondet_unsafe treatment as the condition verdict rather
+        than an LLM-interpreted equivalence principle."""
+
+        def leader_fn() -> dict:
             verdict = self._run_tracking_check(tracking_url)
-            return json.dumps(
-                {
-                    "status": TRACK_NAMES[verdict["status"]],
-                    "reasoning": verdict["reasoning"],
-                },
-                sort_keys=True,
-            )
+            return {"status": TRACK_NAMES[verdict["status"]], "reasoning": verdict["reasoning"]}
 
-        principle = (
-            "Both results are JSON classifications of the same carrier "
-            "tracking page into exactly one of DELIVERED, IN_TRANSIT, "
-            "EXCEPTION, or UNKNOWN. Treat them as equivalent if and only if "
-            "they name the same status. Reasoning wording is irrelevant."
-        )
+        def validator_fn(leaders_res: gl.vm.Result) -> bool:
+            if not isinstance(leaders_res, gl.vm.Return):
+                return self._handle_nondet_leader_error(leaders_res, leader_fn)
+            leader_out = leaders_res.calldata
+            if not isinstance(leader_out, dict):
+                return False
+            try:
+                mine = leader_fn()
+            except gl.vm.UserError as exc:
+                msg = getattr(exc, "message", None) or str(exc)
+                return msg.startswith(ERR_TRANSIENT)
+            except Exception:
+                return False
+            leader_status = str(leader_out.get("status", ""))
+            return leader_status in TRACK_NAMES.values() and leader_status == mine["status"]
 
-        raw_result = gl.eq_principle.prompt_comparative(leader, principle)
-        return _parse_tracking_verdict(raw_result)
+        result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        return _parse_tracking_verdict(result)
 
     # ------------------------------------------------------------------
     #  Deterministic payout routing (no nondet calls below this line).
@@ -695,7 +754,6 @@ Return ONLY a JSON object exactly like:
         tracking_url: str,
         ship_by_ts: int,
         deliver_by_ts: int,
-        now_ts: int,
     ) -> int:
         """Buyer creates and funds a deal. Attach the full agreed price as
         native value.
@@ -709,11 +767,10 @@ Return ONLY a JSON object exactly like:
                 surface; use any stable placeholder URL if genuinely unused,
                 but a real one enables the tracking-proof claim path).
             ship_by_ts: unix ts by which the seller must accept, else the
-                buyer may reclaim.
+                buyer may reclaim. A deal TERM the buyer proposes -- unlike
+                "now", validated against the trusted clock below, not trusted
+                on its own.
             deliver_by_ts: unix ts by which delivery evidence is expected.
-            now_ts: caller-supplied current unix time (this chain has no
-                trusted mid-transaction clock read; validators re-derive
-                deadlines from the same caller-supplied timestamps).
 
         Returns: the new deal id.
         """
@@ -727,7 +784,7 @@ Return ONLY a JSON object exactly like:
         _require(len(item_description) <= MAX_DESCRIPTION_LEN, "item_description too long")
         listing_url = _validate_url(listing_photo_url, "listing_photo_url")
         track_url = _validate_url(tracking_url, "tracking_url")
-        _require(now_ts > 0, "now_ts must be a positive unix timestamp")
+        now_ts = self._now_ts()
         _require(ship_by_ts > now_ts, "ship_by_ts must be in the future")
         _require(deliver_by_ts > ship_by_ts, "deliver_by_ts must be after ship_by_ts")
 
@@ -777,8 +834,9 @@ Return ONLY a JSON object exactly like:
         return deal_id
 
     @gl.public.write
-    def cancel_deal(self, deal_id: int, now_ts: int) -> None:
+    def cancel_deal(self, deal_id: int) -> None:
         """Buyer cancels before the seller has accepted. Full refund."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         sender = gl.message.sender_address
         _require(self._addr_eq(deal.buyer, sender), "only the buyer may cancel")
@@ -792,9 +850,10 @@ Return ONLY a JSON object exactly like:
         self._send_native(deal.buyer, refund)
 
     @gl.public.write.payable
-    def accept_deal(self, deal_id: int, now_ts: int) -> None:
+    def accept_deal(self, deal_id: int) -> None:
         """Seller accepts the deal, optionally posting a performance bond as
         attached value (0 is valid)."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         sender = gl.message.sender_address
         _require(self._addr_eq(deal.seller, sender), "only the named seller may accept")
@@ -808,9 +867,10 @@ Return ONLY a JSON object exactly like:
         self._log(deal_id, "ACCEPT", sender, bond, now_ts, "")
 
     @gl.public.write
-    def timeout_unaccepted_reclaim(self, deal_id: int, now_ts: int) -> None:
+    def timeout_unaccepted_reclaim(self, deal_id: int) -> None:
         """Permissionless: if the seller never accepted by ship_by_ts, the
         buyer's funds are recoverable by anyone calling this on their behalf."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         _require(int(deal.status) == STATUS_CREATED, "deal is not in an unaccepted state")
         _require(now_ts > int(deal.ship_by_ts), "acceptance window has not passed yet")
@@ -824,8 +884,9 @@ Return ONLY a JSON object exactly like:
         self._send_native(deal.buyer, refund)
 
     @gl.public.write
-    def submit_delivery_evidence(self, deal_id: int, delivery_photo_url: str, now_ts: int) -> None:
+    def submit_delivery_evidence(self, deal_id: int, delivery_photo_url: str) -> None:
         """Buyer submits the arrival-condition photo once the item is in hand."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         sender = gl.message.sender_address
         _require(self._addr_eq(deal.buyer, sender), "only the buyer may submit delivery evidence")
@@ -841,11 +902,12 @@ Return ONLY a JSON object exactly like:
         self._log(deal_id, "DELIVERY_SUBMITTED", sender, 0, now_ts, "")
 
     @gl.public.write
-    def timeout_undelivered_reclaim(self, deal_id: int, now_ts: int) -> None:
+    def timeout_undelivered_reclaim(self, deal_id: int) -> None:
         """Permissionless: if the buyer never submitted delivery evidence and
         the outer grace window has elapsed, the buyer's funds (and the
         seller's bond, if any) are recoverable - the buyer is the party
         without the goods, so this timeout resolves in their favor."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         _require(int(deal.status) == STATUS_ACCEPTED, "deal already has delivery evidence or is resolved")
         _require(
@@ -867,13 +929,14 @@ Return ONLY a JSON object exactly like:
     # ========================================================================
 
     @gl.public.write
-    def check_delivery_status(self, deal_id: int, now_ts: int) -> dict:
+    def check_delivery_status(self, deal_id: int) -> dict:
         """Permissionless: fetch and classify the carrier tracking page.
         Does not move funds by itself - it records a fact (`tracking_status`)
         that (a) feeds as context into condition adjudication, and (b) can
         later support `claim_via_tracking_confirmation` if the buyer goes
         silent after real delivery. Deliberately a separate, cheaper round
         from the image adjudication so a slow carrier page never blocks it."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         _require(
             int(deal.status) in (STATUS_ACCEPTED, STATUS_DELIVERY_SUBMITTED),
@@ -893,13 +956,14 @@ Return ONLY a JSON object exactly like:
         return {"status": TRACK_NAMES[result["status"]], "reasoning": result["reasoning"]}
 
     @gl.public.write
-    def claim_via_tracking_confirmation(self, deal_id: int, now_ts: int) -> None:
+    def claim_via_tracking_confirmation(self, deal_id: int) -> None:
         """Seller-side recovery: if tracking has been checked and shows
         DELIVERED, and the buyer never submitted delivery evidence nor
         disputed within a shorter grace window, the seller may claim full
         payment on tracking proof alone. Requires `check_delivery_status` to
         have been called first (by anyone) - this never trusts an
         unverified claim of "it was delivered"."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         _require(int(deal.status) == STATUS_ACCEPTED, "deal already has delivery evidence or is resolved")
         _require(bool(deal.tracking_checked), "call check_delivery_status first")
@@ -928,11 +992,12 @@ Return ONLY a JSON object exactly like:
     # ========================================================================
 
     @gl.public.write
-    def resolve_condition(self, deal_id: int, now_ts: int) -> dict:
+    def resolve_condition(self, deal_id: int) -> dict:
         """Permissionless: run consensus image adjudication comparing the
         listing photo to the submitted delivery photo. Records a verdict but
         does NOT move funds yet - see `finalize_deal` / the contest ladder.
         Retryable from UNDETERMINED."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         status = int(deal.status)
         _require(
@@ -984,12 +1049,13 @@ Return ONLY a JSON object exactly like:
         }
 
     @gl.public.write
-    def force_refund_undetermined(self, deal_id: int, now_ts: int) -> None:
+    def force_refund_undetermined(self, deal_id: int) -> None:
         """Permissionless safety valve: if adjudication has repeatedly failed
         to converge and a further grace window has elapsed, refund the buyer
         in full rather than leaving funds stuck forever. Chosen as the safe
         failure direction because an undetermined visual judgment must never
         default to paying the seller for an unverified delivery."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         _require(int(deal.status) == STATUS_UNDETERMINED, "deal is not in an undetermined state")
         _require(int(deal.resolve_attempts) >= MAX_RESOLVE_ATTEMPTS, "adjudication attempts not yet exhausted")
@@ -1009,9 +1075,10 @@ Return ONLY a JSON object exactly like:
         self._send_native(deal.buyer, price + bond)
 
     @gl.public.write
-    def finalize_deal(self, deal_id: int, now_ts: int) -> None:
+    def finalize_deal(self, deal_id: int) -> None:
         """Permissionless: once the contest window has elapsed with no
         contest bonded, pay out per the recorded verdict."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         _require(int(deal.status) == STATUS_VERDICT_PENDING, "deal has no pending verdict to finalize")
         _require(
@@ -1042,11 +1109,12 @@ Return ONLY a JSON object exactly like:
     # ========================================================================
 
     @gl.public.write.payable
-    def contest_verdict(self, deal_id: int, now_ts: int) -> None:
+    def contest_verdict(self, deal_id: int) -> None:
         """Either party may bond CONTEST_BOND_BPS of the price, within the
         contest window, to force one additional adversarially-framed
         adjudication round before funds finalize. Capped at one contest per
         deal - a bounded escalation ladder, not an unbounded one."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         sender = gl.message.sender_address
         _require(
@@ -1073,12 +1141,13 @@ Return ONLY a JSON object exactly like:
         self._log(deal_id, "CONTESTED", sender, posted, now_ts, "")
 
     @gl.public.write
-    def resolve_contest(self, deal_id: int, now_ts: int) -> dict:
+    def resolve_contest(self, deal_id: int) -> dict:
         """Permissionless: run the second, adversarially-framed adjudication
         and compare it to the originally recorded verdict. If upheld, the
         contester's bond is forfeited to the counterparty and the ORIGINAL
         verdict pays out. If overturned, the contester's bond is returned and
         the NEW verdict pays out instead."""
+        now_ts = self._now_ts()
         deal = self._get_deal(deal_id)
         _require(int(deal.status) == STATUS_CONTESTED, "deal has no active contest")
 

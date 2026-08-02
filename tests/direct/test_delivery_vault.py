@@ -3,11 +3,17 @@ Vault. Runs the contract natively via gltest.direct — no simulator, no
 network. Web and LLM calls are mocked; live consensus behavior is covered
 separately by the StudioNet integration evidence in docs/.
 
+Time is never caller-supplied in this contract (see `_now_ts`, which reads
+GenVM's own patched `datetime.now(timezone.utc)`), so every test that needs
+to simulate elapsed time uses `warp_to()` to move the VM's own clock forward
+instead of passing a spoofable timestamp argument.
+
 Run: pytest tests/direct/ -v
 """
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -31,6 +37,15 @@ def hx(addr) -> str:
     if isinstance(addr, bytes):
         return "0x" + addr.hex()
     return addr.as_hex
+
+
+def warp_to(vm: VMContext, unix_ts: int) -> None:
+    """Advance the VM's own clock to an absolute unix timestamp. This is the
+    only way time moves in these tests -- the contract's `_now_ts()` reads
+    GenVM's patched `datetime.now(timezone.utc)`, which `vm.warp()` controls;
+    there is no caller-supplied timestamp argument left to spoof."""
+    iso = datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    vm.warp(iso)
 
 
 BUYER = create_address("buyer")
@@ -72,23 +87,26 @@ def make_deal(vm, c, ship_by=SHIP_BY, deliver_by=DELIVER_BY, price=1 * GEN) -> i
         TRACKING_URL,
         ship_by,
         deliver_by,
-        NOW,
     )
     vm.value = 0
     return deal_id
 
 
-def accept(vm, c, deal_id, bond=0, now_ts=None):
+def accept(vm, c, deal_id, bond=0, warp_ts=None):
+    if warp_ts is not None:
+        warp_to(vm, warp_ts)
     vm.sender = SELLER
     vm.value = bond
-    c.accept_deal(deal_id, now_ts if now_ts is not None else NOW + 1000)
+    c.accept_deal(deal_id)
     vm.value = 0
 
 
-def submit_evidence(vm, c, deal_id, now_ts=None):
+def submit_evidence(vm, c, deal_id, warp_ts=None):
+    if warp_ts is not None:
+        warp_to(vm, warp_ts)
     vm.sender = BUYER
     vm.value = 0
-    c.submit_delivery_evidence(deal_id, DELIVERY_URL, now_ts if now_ts is not None else DELIVER_BY - 1000)
+    c.submit_delivery_evidence(deal_id, DELIVERY_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +146,7 @@ def test_create_deal_requires_positive_value():
         vm.sender = BUYER
         vm.value = 0
         with vm.expect_revert():
-            c.create_deal(hx(SELLER), "x", "d", LISTING_URL, TRACKING_URL, SHIP_BY, DELIVER_BY, NOW)
+            c.create_deal(hx(SELLER), "x", "d", LISTING_URL, TRACKING_URL, SHIP_BY, DELIVER_BY)
 
 
 def test_create_deal_rejects_same_buyer_and_seller():
@@ -138,7 +156,7 @@ def test_create_deal_rejects_same_buyer_and_seller():
         vm.sender = BUYER
         vm.value = 1 * GEN
         with vm.expect_revert():
-            c.create_deal(hx(BUYER), "x", "d", LISTING_URL, TRACKING_URL, SHIP_BY, DELIVER_BY, NOW)
+            c.create_deal(hx(BUYER), "x", "d", LISTING_URL, TRACKING_URL, SHIP_BY, DELIVER_BY)
 
 
 def test_create_deal_rejects_bad_photo_url():
@@ -148,7 +166,7 @@ def test_create_deal_rejects_bad_photo_url():
         vm.sender = BUYER
         vm.value = 1 * GEN
         with vm.expect_revert():
-            c.create_deal(hx(SELLER), "x", "d", "ftp://not-http", TRACKING_URL, SHIP_BY, DELIVER_BY, NOW)
+            c.create_deal(hx(SELLER), "x", "d", "ftp://not-http", TRACKING_URL, SHIP_BY, DELIVER_BY)
 
 
 def test_create_deal_rejects_deliver_before_ship():
@@ -158,7 +176,7 @@ def test_create_deal_rejects_deliver_before_ship():
         vm.sender = BUYER
         vm.value = 1 * GEN
         with vm.expect_revert():
-            c.create_deal(hx(SELLER), "x", "d", LISTING_URL, TRACKING_URL, SHIP_BY, SHIP_BY - 10, NOW)
+            c.create_deal(hx(SELLER), "x", "d", LISTING_URL, TRACKING_URL, SHIP_BY, SHIP_BY - 10)
 
 
 def test_create_deal_rejects_ship_by_in_the_past():
@@ -168,7 +186,20 @@ def test_create_deal_rejects_ship_by_in_the_past():
         vm.sender = BUYER
         vm.value = 1 * GEN
         with vm.expect_revert():
-            c.create_deal(hx(SELLER), "x", "d", LISTING_URL, TRACKING_URL, NOW - 10, DELIVER_BY, NOW)
+            c.create_deal(hx(SELLER), "x", "d", LISTING_URL, TRACKING_URL, NOW - 10, DELIVER_BY)
+
+
+def test_create_deal_uses_trusted_clock_not_a_caller_argument():
+    """A caller cannot lie about 'now' -- there is no now_ts parameter left
+    to pass, so ship_by_ts is validated against the VM's own warped clock."""
+    vm = VMContext()
+    with vm.activate():
+        c = fresh(vm)
+        warp_to(vm, SHIP_BY + 100)  # advance the trusted clock past SHIP_BY
+        vm.sender = BUYER
+        vm.value = 1 * GEN
+        with vm.expect_revert():  # ship_by_ts (fixed) is now in the trusted past
+            c.create_deal(hx(SELLER), "x", "d", LISTING_URL, TRACKING_URL, SHIP_BY, DELIVER_BY)
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +212,7 @@ def test_cancel_deal_refunds_buyer_pre_acceptance():
         c = fresh(vm)
         did = make_deal(vm, c)
         vm.sender = BUYER
-        c.cancel_deal(did, NOW + 10)
+        c.cancel_deal(did)
         deal = c.get_deal(did)
         assert deal["status"] == "CANCELLED"
         assert deal["price_deposited_wei"] == 0
@@ -194,7 +225,7 @@ def test_cancel_deal_only_buyer_may_cancel():
         did = make_deal(vm, c)
         vm.sender = SELLER
         with vm.expect_revert():
-            c.cancel_deal(did, NOW + 10)
+            c.cancel_deal(did)
 
 
 def test_cancel_deal_rejected_after_acceptance():
@@ -205,7 +236,7 @@ def test_cancel_deal_rejected_after_acceptance():
         accept(vm, c, did)
         vm.sender = BUYER
         with vm.expect_revert():
-            c.cancel_deal(did, NOW + 2000)
+            c.cancel_deal(did)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +251,7 @@ def test_accept_deal_only_named_seller():
         vm.sender = OTHER
         vm.value = 0
         with vm.expect_revert():
-            c.accept_deal(did, NOW + 10)
+            c.accept_deal(did)
 
 
 def test_accept_deal_with_bond_recorded():
@@ -239,10 +270,11 @@ def test_accept_deal_after_ship_by_reverts():
     with vm.activate():
         c = fresh(vm)
         did = make_deal(vm, c)
+        warp_to(vm, SHIP_BY + 1)
         vm.sender = SELLER
         vm.value = 0
         with vm.expect_revert():
-            c.accept_deal(did, SHIP_BY + 1)
+            c.accept_deal(did)
 
 
 def test_timeout_unaccepted_reclaim_before_deadline_reverts():
@@ -251,7 +283,7 @@ def test_timeout_unaccepted_reclaim_before_deadline_reverts():
         c = fresh(vm)
         did = make_deal(vm, c)
         with vm.expect_revert():
-            c.timeout_unaccepted_reclaim(did, SHIP_BY - 1)
+            c.timeout_unaccepted_reclaim(did)
 
 
 def test_timeout_unaccepted_reclaim_refunds_after_deadline():
@@ -259,7 +291,8 @@ def test_timeout_unaccepted_reclaim_refunds_after_deadline():
     with vm.activate():
         c = fresh(vm)
         did = make_deal(vm, c)
-        c.timeout_unaccepted_reclaim(did, SHIP_BY + 1)
+        warp_to(vm, SHIP_BY + 1)
+        c.timeout_unaccepted_reclaim(did)
         deal = c.get_deal(did)
         assert deal["status"] == "TIMEOUT_UNACCEPTED"
         assert deal["price_deposited_wei"] == 0
@@ -270,9 +303,10 @@ def test_timeout_unaccepted_reclaim_twice_reverts():
     with vm.activate():
         c = fresh(vm)
         did = make_deal(vm, c)
-        c.timeout_unaccepted_reclaim(did, SHIP_BY + 1)
+        warp_to(vm, SHIP_BY + 1)
+        c.timeout_unaccepted_reclaim(did)
         with vm.expect_revert():
-            c.timeout_unaccepted_reclaim(did, SHIP_BY + 2)
+            c.timeout_unaccepted_reclaim(did)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +321,7 @@ def test_submit_delivery_evidence_only_buyer():
         accept(vm, c, did)
         vm.sender = SELLER
         with vm.expect_revert():
-            c.submit_delivery_evidence(did, DELIVERY_URL, DELIVER_BY - 100)
+            c.submit_delivery_evidence(did, DELIVERY_URL)
 
 
 def test_submit_delivery_evidence_requires_accepted_state():
@@ -297,7 +331,7 @@ def test_submit_delivery_evidence_requires_accepted_state():
         did = make_deal(vm, c)
         vm.sender = BUYER
         with vm.expect_revert():
-            c.submit_delivery_evidence(did, DELIVERY_URL, NOW + 100)  # never accepted
+            c.submit_delivery_evidence(did, DELIVERY_URL)  # never accepted
 
 
 def test_submit_delivery_evidence_after_outer_grace_reverts():
@@ -306,9 +340,10 @@ def test_submit_delivery_evidence_after_outer_grace_reverts():
         c = fresh(vm)
         did = make_deal(vm, c)
         accept(vm, c, did)
+        warp_to(vm, DELIVER_BY + 7 * 86400 + 10)
         vm.sender = BUYER
         with vm.expect_revert():
-            c.submit_delivery_evidence(did, DELIVERY_URL, DELIVER_BY + 7 * 86400 + 10)
+            c.submit_delivery_evidence(did, DELIVERY_URL)
 
 
 def test_timeout_undelivered_reclaim_refunds_buyer_and_bond():
@@ -317,7 +352,8 @@ def test_timeout_undelivered_reclaim_refunds_buyer_and_bond():
         c = fresh(vm)
         did = make_deal(vm, c)
         accept(vm, c, did, bond=int(0.05 * GEN))
-        c.timeout_undelivered_reclaim(did, DELIVER_BY + 7 * 86400 + 1)
+        warp_to(vm, DELIVER_BY + 7 * 86400 + 1)
+        c.timeout_undelivered_reclaim(did)
         deal = c.get_deal(did)
         assert deal["status"] == "TIMEOUT_UNDELIVERED"
         assert deal["price_deposited_wei"] == 0
@@ -330,8 +366,9 @@ def test_timeout_undelivered_reclaim_before_grace_reverts():
         c = fresh(vm)
         did = make_deal(vm, c)
         accept(vm, c, did)
+        warp_to(vm, DELIVER_BY + 1)
         with vm.expect_revert():
-            c.timeout_undelivered_reclaim(did, DELIVER_BY + 1)
+            c.timeout_undelivered_reclaim(did)
 
 
 def test_timeout_undelivered_reclaim_blocked_once_evidence_submitted():
@@ -341,8 +378,9 @@ def test_timeout_undelivered_reclaim_blocked_once_evidence_submitted():
         did = make_deal(vm, c)
         accept(vm, c, did)
         submit_evidence(vm, c, did)
+        warp_to(vm, DELIVER_BY + 7 * 86400 + 1)
         with vm.expect_revert():
-            c.timeout_undelivered_reclaim(did, DELIVER_BY + 7 * 86400 + 1)
+            c.timeout_undelivered_reclaim(did)
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +394,7 @@ def test_check_delivery_status_records_tracking():
         did = make_deal(vm, c)
         accept(vm, c, did)
         mock_tracking(vm, "DELIVERED")
-        result = c.check_delivery_status(did, DELIVER_BY - 100)
+        result = c.check_delivery_status(did)
         assert result["status"] == "DELIVERED"
         deal = c.get_deal(did)
         assert deal["tracking_checked"] is True
@@ -369,8 +407,9 @@ def test_claim_via_tracking_confirmation_requires_checked_first():
         c = fresh(vm)
         did = make_deal(vm, c)
         accept(vm, c, did)
+        warp_to(vm, DELIVER_BY + 3 * 86400 + 1)
         with vm.expect_revert():
-            c.claim_via_tracking_confirmation(did, DELIVER_BY + 3 * 86400 + 1)
+            c.claim_via_tracking_confirmation(did)
 
 
 def test_claim_via_tracking_confirmation_requires_delivered_status():
@@ -380,9 +419,10 @@ def test_claim_via_tracking_confirmation_requires_delivered_status():
         did = make_deal(vm, c)
         accept(vm, c, did)
         mock_tracking(vm, "IN_TRANSIT")
-        c.check_delivery_status(did, DELIVER_BY - 100)
+        c.check_delivery_status(did)
+        warp_to(vm, DELIVER_BY + 3 * 86400 + 1)
         with vm.expect_revert():
-            c.claim_via_tracking_confirmation(did, DELIVER_BY + 3 * 86400 + 1)
+            c.claim_via_tracking_confirmation(did)
 
 
 def test_claim_via_tracking_confirmation_before_grace_reverts():
@@ -392,9 +432,10 @@ def test_claim_via_tracking_confirmation_before_grace_reverts():
         did = make_deal(vm, c)
         accept(vm, c, did)
         mock_tracking(vm, "DELIVERED")
-        c.check_delivery_status(did, DELIVER_BY - 100)
+        c.check_delivery_status(did)
+        warp_to(vm, DELIVER_BY + 1)
         with vm.expect_revert():
-            c.claim_via_tracking_confirmation(did, DELIVER_BY + 1)
+            c.claim_via_tracking_confirmation(did)
 
 
 def test_claim_via_tracking_confirmation_pays_seller_after_grace():
@@ -404,8 +445,9 @@ def test_claim_via_tracking_confirmation_pays_seller_after_grace():
         did = make_deal(vm, c)
         accept(vm, c, did, bond=int(0.1 * GEN))
         mock_tracking(vm, "DELIVERED")
-        c.check_delivery_status(did, DELIVER_BY - 100)
-        c.claim_via_tracking_confirmation(did, DELIVER_BY + 3 * 86400 + 1)
+        c.check_delivery_status(did)
+        warp_to(vm, DELIVER_BY + 3 * 86400 + 1)
+        c.claim_via_tracking_confirmation(did)
         deal = c.get_deal(did)
         assert deal["status"] == "FINALIZED_TRACKING_CLAIM"
         assert deal["price_deposited_wei"] == 0
@@ -419,10 +461,11 @@ def test_claim_via_tracking_confirmation_blocked_once_evidence_submitted():
         did = make_deal(vm, c)
         accept(vm, c, did)
         mock_tracking(vm, "DELIVERED")
-        c.check_delivery_status(did, DELIVER_BY - 100)
+        c.check_delivery_status(did)
         submit_evidence(vm, c, did)
+        warp_to(vm, DELIVER_BY + 3 * 86400 + 1)
         with vm.expect_revert():
-            c.claim_via_tracking_confirmation(did, DELIVER_BY + 3 * 86400 + 1)
+            c.claim_via_tracking_confirmation(did)
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +481,7 @@ def test_resolve_condition_match_records_verdict_pending():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         mock_condition_verdict(vm, "MATCH")
-        result = c.resolve_condition(did, DELIVER_BY)
+        result = c.resolve_condition(did)
         assert result["status"] == "VERDICT_PENDING"
         assert result["band"] == "MATCH"
         deal = c.get_deal(did)
@@ -454,7 +497,7 @@ def test_resolve_condition_not_received_when_delivery_photo_unfetchable():
         accept(vm, c, did)
         submit_evidence(vm, c, did)
         mock_photos(vm, delivery_status=404, delivery_body="")
-        result = c.resolve_condition(did, DELIVER_BY)
+        result = c.resolve_condition(did)
         assert result["band"] == "NOT_RECEIVED"
 
 
@@ -467,7 +510,7 @@ def test_resolve_condition_minor_discrepancy_bps_banded():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         mock_condition_verdict(vm, "MINOR_DISCREPANCY", seller_payout_bps=7234)  # should bucket to 7000 or 7500
-        result = c.resolve_condition(did, DELIVER_BY)
+        result = c.resolve_condition(did)
         assert result["band"] == "MINOR_DISCREPANCY"
         assert result["seller_payout_bps"] % 500 == 0
 
@@ -481,7 +524,7 @@ def test_resolve_condition_major_discrepancy():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         mock_condition_verdict(vm, "MAJOR_DISCREPANCY")
-        result = c.resolve_condition(did, DELIVER_BY)
+        result = c.resolve_condition(did)
         assert result["band"] == "MAJOR_DISCREPANCY"
 
 
@@ -494,7 +537,7 @@ def test_resolve_condition_malformed_llm_output_sets_undetermined():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         vm.mock_llm(r".*", "not even json")
-        result = c.resolve_condition(did, DELIVER_BY)
+        result = c.resolve_condition(did)
         assert result["status"] == "UNDETERMINED"
         deal = c.get_deal(did)
         assert deal["status"] == "UNDETERMINED"
@@ -511,7 +554,7 @@ def test_resolve_condition_unrecognized_band_name_sets_undetermined():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         vm.mock_llm(r".*", json.dumps({"band": "PERFECT", "reasoning": "great"}))
-        result = c.resolve_condition(did, DELIVER_BY)
+        result = c.resolve_condition(did)
         assert result["status"] == "UNDETERMINED"
 
 
@@ -524,11 +567,11 @@ def test_resolve_condition_retries_after_undetermined():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         vm.mock_llm(r".*", "garbage")
-        c.resolve_condition(did, DELIVER_BY)
+        c.resolve_condition(did)
         vm.clear_mocks()
         mock_photos(vm)
         mock_condition_verdict(vm, "MATCH")
-        result = c.resolve_condition(did, DELIVER_BY + 10)
+        result = c.resolve_condition(did)
         assert result["status"] == "VERDICT_PENDING"
         assert c.get_deal(did)["resolve_attempts"] == 2
 
@@ -542,9 +585,9 @@ def test_force_refund_undetermined_requires_max_attempts():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         vm.mock_llm(r".*", "garbage")
-        c.resolve_condition(did, DELIVER_BY)
+        c.resolve_condition(did)
         with vm.expect_revert():
-            c.force_refund_undetermined(did, DELIVER_BY + 999999)
+            c.force_refund_undetermined(did)
 
 
 def test_force_refund_undetermined_refunds_buyer_after_exhaustion():
@@ -556,13 +599,14 @@ def test_force_refund_undetermined_refunds_buyer_after_exhaustion():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         vm.mock_llm(r".*", "garbage")
-        t = DELIVER_BY
         for _ in range(5):
-            c.resolve_condition(did, t)
-            t += 10
+            c.resolve_condition(did)
         with vm.expect_revert():  # attempts exhausted but grace not elapsed
-            c.force_refund_undetermined(did, t + 1)
-        c.force_refund_undetermined(did, t + 3 * 86400 + 100)
+            c.force_refund_undetermined(did)
+        # last_activity_ts falls back to deliver_by_ts (resolved_ts stays 0
+        # on every UNDETERMINED pass), so the grace window is measured from there.
+        warp_to(vm, DELIVER_BY + 3 * 86400 + 100)
+        c.force_refund_undetermined(did)
         deal = c.get_deal(did)
         assert deal["status"] == "TIMEOUT_UNDETERMINED_REFUND"
         assert deal["price_deposited_wei"] == 0
@@ -576,7 +620,7 @@ def test_resolve_condition_requires_delivery_submitted_state():
         did = make_deal(vm, c)
         accept(vm, c, did)
         with vm.expect_revert():
-            c.resolve_condition(did, NOW + 100)  # no delivery evidence yet
+            c.resolve_condition(did)  # no delivery evidence yet
 
 
 # ---------------------------------------------------------------------------
@@ -592,9 +636,9 @@ def test_finalize_deal_before_contest_window_reverts():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         mock_condition_verdict(vm, "MATCH")
-        c.resolve_condition(did, DELIVER_BY)
+        c.resolve_condition(did)
         with vm.expect_revert():
-            c.finalize_deal(did, DELIVER_BY + 1)
+            c.finalize_deal(did)
 
 
 def test_finalize_deal_pays_match_in_full_to_seller():
@@ -606,8 +650,9 @@ def test_finalize_deal_pays_match_in_full_to_seller():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         mock_condition_verdict(vm, "MATCH")
-        c.resolve_condition(did, DELIVER_BY)
-        c.finalize_deal(did, DELIVER_BY + 172800 + 1)
+        c.resolve_condition(did)
+        warp_to(vm, c.get_deal(did)["resolved_ts"] + 172800 + 1)
+        c.finalize_deal(did)
         deal = c.get_deal(did)
         assert deal["status"] == "FINALIZED_MATCH"
         assert deal["price_deposited_wei"] == 0
@@ -623,8 +668,9 @@ def test_finalize_deal_pays_major_discrepancy_refunds_buyer():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         mock_condition_verdict(vm, "MAJOR_DISCREPANCY")
-        c.resolve_condition(did, DELIVER_BY)
-        c.finalize_deal(did, DELIVER_BY + 172800 + 1)
+        c.resolve_condition(did)
+        warp_to(vm, c.get_deal(did)["resolved_ts"] + 172800 + 1)
+        c.finalize_deal(did)
         deal = c.get_deal(did)
         assert deal["status"] == "FINALIZED_MAJOR_DISCREPANCY"
         assert deal["price_deposited_wei"] == 0
@@ -640,10 +686,11 @@ def test_finalize_deal_twice_reverts():
         submit_evidence(vm, c, did)
         mock_photos(vm)
         mock_condition_verdict(vm, "MATCH")
-        c.resolve_condition(did, DELIVER_BY)
-        c.finalize_deal(did, DELIVER_BY + 172800 + 1)
+        c.resolve_condition(did)
+        warp_to(vm, c.get_deal(did)["resolved_ts"] + 172800 + 1)
+        c.finalize_deal(did)
         with vm.expect_revert():
-            c.finalize_deal(did, DELIVER_BY + 172800 + 2)
+            c.finalize_deal(did)
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +702,7 @@ def _resolve_to_pending(vm, c, did, band="MAJOR_DISCREPANCY", bps=0):
     submit_evidence(vm, c, did)
     mock_photos(vm)
     mock_condition_verdict(vm, band, seller_payout_bps=bps)
-    c.resolve_condition(did, DELIVER_BY)
+    c.resolve_condition(did)
 
 
 def test_contest_verdict_requires_exact_bond():
@@ -667,7 +714,7 @@ def test_contest_verdict_requires_exact_bond():
         vm.sender = SELLER
         vm.value = int(0.1 * GEN)  # wrong amount (bond is 15% of price)
         with vm.expect_revert():
-            c.contest_verdict(did, DELIVER_BY + 10)
+            c.contest_verdict(did)
         vm.value = 0
 
 
@@ -680,7 +727,7 @@ def test_contest_verdict_only_buyer_or_seller():
         vm.sender = OTHER
         vm.value = int(0.15 * GEN)
         with vm.expect_revert():
-            c.contest_verdict(did, DELIVER_BY + 10)
+            c.contest_verdict(did)
         vm.value = 0
 
 
@@ -690,10 +737,11 @@ def test_contest_verdict_after_window_reverts():
         c = fresh(vm)
         did = make_deal(vm, c)
         _resolve_to_pending(vm, c, did)
+        warp_to(vm, c.get_deal(did)["resolved_ts"] + 172800 + 1)
         vm.sender = SELLER
         vm.value = int(0.15 * GEN)
         with vm.expect_revert():
-            c.contest_verdict(did, DELIVER_BY + 172800 + 1)
+            c.contest_verdict(did)
         vm.value = 0
 
 
@@ -705,7 +753,7 @@ def test_contest_verdict_only_once_per_deal():
         _resolve_to_pending(vm, c, did)
         vm.sender = SELLER
         vm.value = int(0.15 * GEN)
-        c.contest_verdict(did, DELIVER_BY + 10)
+        c.contest_verdict(did)
         vm.value = 0
 
         # Resolve the contest so status leaves CONTESTED, then a hypothetical
@@ -713,11 +761,11 @@ def test_contest_verdict_only_once_per_deal():
         # because the deal is no longer VERDICT_PENDING/CONTESTED.
         mock_photos(vm)
         mock_condition_verdict(vm, "MAJOR_DISCREPANCY")
-        c.resolve_contest(did, DELIVER_BY + 20)
+        c.resolve_contest(did)
         vm.sender = BUYER
         vm.value = int(0.15 * GEN)
         with vm.expect_revert():
-            c.contest_verdict(did, DELIVER_BY + 30)
+            c.contest_verdict(did)
         vm.value = 0
 
 
@@ -729,12 +777,12 @@ def test_resolve_contest_upheld_forfeits_bond_to_counterparty():
         _resolve_to_pending(vm, c, did, band="MAJOR_DISCREPANCY")
         vm.sender = SELLER  # seller contests the MAJOR_DISCREPANCY verdict
         vm.value = int(0.15 * GEN)
-        c.contest_verdict(did, DELIVER_BY + 10)
+        c.contest_verdict(did)
         vm.value = 0
 
         mock_photos(vm)
         mock_condition_verdict(vm, "MAJOR_DISCREPANCY")  # second opinion agrees
-        result = c.resolve_contest(did, DELIVER_BY + 20)
+        result = c.resolve_contest(did)
         assert result["outcome"] == "UPHELD"
         deal = c.get_deal(did)
         assert deal["contest_outcome"] == "UPHELD"
@@ -751,13 +799,13 @@ def test_resolve_contest_overturned_reroutes_payout():
         _resolve_to_pending(vm, c, did, band="MAJOR_DISCREPANCY")
         vm.sender = SELLER
         vm.value = int(0.15 * GEN)
-        c.contest_verdict(did, DELIVER_BY + 10)
+        c.contest_verdict(did)
         vm.value = 0
 
         vm.clear_mocks()
         mock_photos(vm)
         mock_condition_verdict(vm, "MATCH")  # second opinion overturns to MATCH
-        result = c.resolve_contest(did, DELIVER_BY + 20)
+        result = c.resolve_contest(did)
         assert result["outcome"] == "OVERTURNED"
         deal = c.get_deal(did)
         assert deal["contest_outcome"] == "OVERTURNED"
@@ -772,7 +820,7 @@ def test_resolve_contest_requires_contested_state():
         did = make_deal(vm, c)
         _resolve_to_pending(vm, c, did)
         with vm.expect_revert():
-            c.resolve_contest(did, DELIVER_BY + 10)  # never contested
+            c.resolve_contest(did)  # never contested
 
 
 # ---------------------------------------------------------------------------

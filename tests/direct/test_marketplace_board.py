@@ -39,7 +39,7 @@ def test_buy_listing_marks_funded_without_reverting():
         c.post_listing("Vintage bicycle")
         vm.sender = BUYER
         vm.value = 1 * GEN
-        c.buy_listing(0, "steel frame, 21-speed", "https://x.test/l.jpg", "https://x.test/t", 1, 2, 0)
+        c.buy_listing(0, "steel frame, 21-speed", "https://x.test/l.jpg", "https://x.test/t", 1, 2)
         vm.value = 0
         assert c.get_listing(0)["has_deal"] is True
 
@@ -51,7 +51,7 @@ def test_buy_listing_rejects_unknown_listing():
         vm.sender = BUYER
         vm.value = 1 * GEN
         with vm.expect_revert():
-            c.buy_listing(99, "d", "https://x.test/l.jpg", "https://x.test/t", 1, 2, 0)
+            c.buy_listing(99, "d", "https://x.test/l.jpg", "https://x.test/t", 1, 2)
         vm.value = 0
 
 
@@ -63,9 +63,9 @@ def test_buy_listing_rejects_double_funding():
         c.post_listing("Vintage bicycle")
         vm.sender = BUYER
         vm.value = 1 * GEN
-        c.buy_listing(0, "d", "https://x.test/l.jpg", "https://x.test/t", 1, 2, 0)
+        c.buy_listing(0, "d", "https://x.test/l.jpg", "https://x.test/t", 1, 2)
         with vm.expect_revert():
-            c.buy_listing(0, "d", "https://x.test/l.jpg", "https://x.test/t", 1, 2, 0)
+            c.buy_listing(0, "d", "https://x.test/l.jpg", "https://x.test/t", 1, 2)
         vm.value = 0
 
 

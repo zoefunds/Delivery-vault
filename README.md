@@ -57,9 +57,11 @@ funds — which is exactly what none of the alternatives above can offer.
   only "what does this evidence show." Every payout, deadline, and state
   transition is deterministic code reading a recorded verdict, never a live
   decision by the model.
-- **Not a format-only validator**: the equivalence principle in
-  `_adjudicate_condition_nondet` requires agreement on the substantive verdict
-  (which band, and within what payout tolerance), not on JSON shape. See
+- **Not a format-only validator**: `_adjudicate_condition_nondet` requires
+  agreement on the substantive verdict — the band, and, when it's
+  MINOR_DISCREPANCY, the *exact* settlement bucket — not on JSON shape. This
+  is enforced in Python (`gl.vm.run_nondet_unsafe`), not left to an LLM's
+  reading of a prose tolerance. See
   [Equivalence principles](#equivalence-principles-in-full) below.
 - **Not judging from user-submitted text alone**: the listing photo, the
   delivery photo, and the tracking page are all fetched by the contract
@@ -91,35 +93,74 @@ Access control, every timestamp comparison, all escrow arithmetic, the bps
 math for splits, the mapping from a verdict band to who gets paid, storage
 writes, activity logging, input validation, and output sanitization (band
 name whitelisting, bps clamping and bucketing). The model is asked what the
-evidence shows; the contract decides what happens next.
+evidence shows; the contract decides what happens next. Critically, "what
+time it is" is *also* deterministic and consensus-agreed rather than an
+input the model or the caller supplies — see
+[Trusted time](#trusted-time-not-a-caller-supplied-argument) below.
 
 ### Equivalence principles, in full
 
-Condition adjudication (`prompt_comparative` — never `prompt_non_comparative`,
-since this decides a payout and reviewers correctly treat non-comparative
-judging-a-payout as a fake-consensus smell):
+Both nondet operations that gate money (condition adjudication and tracking
+classification) use `gl.vm.run_nondet_unsafe` with a **Python-written
+`validator_fn`**, not `gl.eq_principle.prompt_comparative` with a
+natural-language tolerance the model interprets. This was a direct fix in
+response to review: an earlier version used `prompt_comparative` with a
+prose principle allowing `seller_payout_bps` values "within 1500 of each
+other" to count as equivalent — but the *only* value that ever actually gets
+used for settlement is the leader's raw proposal, so a 15-percentage-point
+LLM-judged tolerance meant real money could be split by a number no
+validator had itself independently verified, just one the model was willing
+to call "close enough." See
+[Fixes made in response to review](#fixes-made-in-response-to-external-review)
+below for the full before/after.
 
-> "Both results are JSON verdicts about whether a physical item's delivered
-> condition matches its promised listing condition, based on the same
-> listing photo and delivery photo. Treat them as equivalent if they agree
-> on the 'band' value (MATCH, MINOR_DISCREPANCY, MAJOR_DISCREPANCY, or
-> NOT_RECEIVED) AND, when the band is MINOR_DISCREPANCY, their
-> 'seller_payout_bps' values are within 1500 of each other. Differences in
-> wording of 'reasoning', which discrepancy is named first, formatting, or
-> key order are irrelevant. A different band, or a materially different
-> payout split outside that tolerance, is NOT equivalent."
+**Condition adjudication** (`_adjudicate_condition_nondet`): the leader
+proposes `{band, seller_payout_bps, reasoning}`; every validator
+independently re-runs the identical fetch-and-judge task and its
+`validator_fn` requires, in code:
 
-Tracking classification (also `prompt_comparative`):
+- the `band` to match the leader's **exactly** (no tolerance on the
+  category at all), and
+- when `band == MINOR_DISCREPANCY`, the `seller_payout_bps` — already
+  rounded to the nearest 500 (5 percentage points) by
+  `_parse_condition_verdict` before comparison — to match the leader's
+  **exactly**.
 
-> "Both results are JSON classifications of the same carrier tracking page
-> into exactly one of DELIVERED, IN_TRANSIT, EXCEPTION, or UNKNOWN. Treat
-> them as equivalent if and only if they name the same status. Reasoning
-> wording is irrelevant."
+Two independent runs either land in the same discrete 500-wide bucket
+(agree) or they don't (disagree, leader rotates). There is no "close
+enough" left anywhere in the path that decides how much money each party
+receives.
 
-The minor-discrepancy payout split is banded to the nearest 500 bps (5
-percentage points) before comparison — validators compare a coarse category,
-not a float. `strict_eq` is never used: nothing here produces byte-identical
-output validators could reproduce deterministically.
+**Tracking classification** (`_check_tracking_nondet`): same mechanism —
+`validator_fn` requires the classified `status` (DELIVERED / IN_TRANSIT /
+EXCEPTION / UNKNOWN) to match the leader's exactly. This one also gates a
+full payout (`claim_via_tracking_confirmation`), so it gets the same
+code-enforced treatment even though the category was already binary in the
+old prose principle.
+
+Leader/error handling (`_handle_nondet_leader_error`) still classifies by
+prefix: deterministic errors must match exactly, transient errors agree if
+both sides are transient, and LLM/unknown errors force disagreement so
+consensus rotates the leader instead of persisting garbage. `strict_eq` is
+never used: nothing here produces byte-identical output across independent
+model calls in the first place — the exactness is enforced on the
+*normalized, bucketed decision fields*, not on raw model text.
+
+### Trusted time, not a caller-supplied argument
+
+Every method that used to take a `now_ts: int` parameter (there were 12 of
+them) no longer does. `_now_ts()` reads GenVM's own patched
+`datetime.now(timezone.utc)` — the network's consensus-agreed block time,
+identical across every validator — instead of trusting whatever integer a
+transaction sender happened to pass in. This was the other direct fix from
+review: with a caller-supplied `now_ts`, a buyer could call
+`timeout_unaccepted_reclaim` (or any other deadline-gated method) with a
+fabricated future timestamp and reclaim funds before the real deadline had
+passed, or a seller could similarly lie in the other direction. `ship_by_ts`
+and `deliver_by_ts` remain caller-supplied — they're deal *terms* the buyer
+proposes at creation time (like "ship within 3 days"), not claims about
+"what time is it right now" — and are validated against the trusted clock,
+never against each other's say-so.
 
 ### The "does the deterministic half make consensus pointless?" objection
 
@@ -198,6 +239,50 @@ it can't be used to stall indefinitely.
 
 The pattern throughout: **any call that could bias who gets paid is restricted to the party who bears that specific risk; any call whose outcome is already fixed by prior consensus or by the deal's own rules is left permissionless**, so neither party can stall the other by refusing to submit a transaction.
 
+## Fixes made in response to external review
+
+A team review of the first submission raised two findings. Both are fixed,
+not just documented around:
+
+1. **"The escrow payout is not fully bound by validator consensus: two
+   minor-discrepancy results up to 1,500 basis points apart are treated as
+   equivalent even though that raw value directly controls how much each
+   party receives."** Confirmed and fixed. The old design used
+   `gl.eq_principle.prompt_comparative` with a natural-language principle
+   telling the model that two `seller_payout_bps` values "within 1500 of
+   each other" were equivalent — but only the leader's proposed value was
+   ever written to storage and paid out, so the actual settlement figure
+   was whatever the leader happened to propose, only loosely bounded by an
+   LLM's *interpretation* of a tolerance, not a code-level check. Fixed by
+   switching `_adjudicate_condition_nondet` and `_check_tracking_nondet` to
+   `gl.vm.run_nondet_unsafe` with a `validator_fn` written in plain Python:
+   the band must match the leader's exactly, and the bucketed
+   `seller_payout_bps` (already rounded to the nearest 500) must also match
+   the leader's exactly. The exact bucket used for settlement is now
+   provably identical between the leader and every agreeing validator's own
+   independent re-derivation — see
+   [Equivalence principles, in full](#equivalence-principles-in-full).
+
+2. **"Replace unrestricted caller-supplied deadline timestamps with a
+   trusted time mechanism before resubmitting."** Confirmed and fixed. Every
+   one of the 12 write methods that took a `now_ts: int` parameter had it
+   removed; `_now_ts()` now reads GenVM's consensus-agreed
+   `datetime.now(timezone.utc)` internally instead. Previously a caller
+   could, for example, call `timeout_unaccepted_reclaim(deal_id, now_ts=
+   ship_by_ts + 999999)` and reclaim funds immediately regardless of real
+   elapsed time — every timeout, grace window, and contest deadline was
+   only as trustworthy as whatever the transaction sender claimed "now" was.
+   See [Trusted time, not a caller-supplied argument](#trusted-time-not-a-caller-supplied-argument).
+
+Both fixes were verified live, not just in mocked direct tests: on
+StudioNet, `timeout_unaccepted_reclaim` was called only after genuinely
+waiting out a real elapsed window (the test process sleeps until the real
+clock passes `ship_by_ts` — there is no other way to satisfy it anymore),
+and a full contest round (`contest_verdict` → `resolve_contest`) reached
+consensus on an exact settlement bucket with no LLM-judged tolerance
+involved anywhere in the path. See
+[Measured on live consensus](#measured-on-live-consensus).
+
 ## Safety properties (each backed by a named test)
 
 - Double-spend structurally impossible: every payout path zeroes its ledger
@@ -242,13 +327,17 @@ class DeliveryVault:
     class Write:
         def create_deal(self, seller: str, item_title: str, item_description: str,
                          listing_photo_url: str, tracking_url: str,
-                         ship_by_ts: int, deliver_by_ts: int, now_ts: int) -> int: ...
+                         ship_by_ts: int, deliver_by_ts: int) -> int: ...
 
 vault = gl.get_contract_at(Address(VAULT_ADDRESS))
 vault.emit(value=gl.message.value, on="finalized").create_deal(
-    seller, title, description, listing_url, tracking_url, ship_by, deliver_by, now
+    seller, title, description, listing_url, tracking_url, ship_by, deliver_by
 )
 ```
+
+Note there is no `now_ts` argument — every timestamp the vault reads for
+"what time is it right now" comes from its own trusted clock, never from a
+consumer's calldata.
 
 The same primitive, parameterized only by strings and timestamps, covers:
 
@@ -282,7 +371,7 @@ definitions.
 genvm-lint check contracts/delivery_vault.py --json
 genvm-lint check examples/marketplace_board.py --json
 
-# Direct (in-memory) tests — 57 tests, no network
+# Direct (in-memory) tests — 58 tests, no network
 pytest tests/direct/ -v
 
 # StudioNet integration tests (real GEN, real consensus; needs .keys/*.json — see below)
@@ -302,47 +391,50 @@ StudioNet is gasless, so any account works with a zero or nonzero balance.
 ## Status
 
 - `genvm-lint`: clean on both the primitive and the consumer example.
-- Direct tests: **57 passing** (`tests/direct/`), weighted toward adversarial
-  and boundary cases.
-- Deployed on StudioNet: `0xd661bea0F9796CA39d8bA4BBe5cF09E7C7138758`
-  ([explorer](https://genlayer-explorer.vercel.app/contracts/0xd661bea0F9796CA39d8bA4BBe5cF09E7C7138758))
-- Every write method except `force_refund_undetermined` has been executed
-  against the live deployed address (see below); `force_refund_undetermined`
-  is covered by 2 direct tests but not exercised live in this pass, since
-  forcing it live needs 5 exhausted adjudication rounds plus a 3-day grace
-  window.
+- Direct tests: **58 passing** (`tests/direct/`), weighted toward adversarial
+  and boundary cases, including a dedicated test confirming a spoofed
+  `now_ts` can no longer be passed at all
+  (`test_create_deal_uses_trusted_clock_not_a_caller_argument`).
+- Redeployed on StudioNet after the review fixes:
+  `0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054`
+  ([explorer](https://genlayer-explorer.vercel.app/contracts/0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054))
+- Every write method except `claim_via_tracking_confirmation`,
+  `timeout_undelivered_reclaim`, and `force_refund_undetermined` has been
+  executed against this redeployed address (see below). Those three are
+  covered by direct tests with a warped clock, but were not exercised live
+  in this pass because — now that time is genuinely trustworthy — they each
+  require waiting out a real multi-day grace window on StudioNet, not
+  something fakeable anymore in a single automated run.
 
 ## Measured on live consensus
 
-Real StudioNet runs, this pass (all timestamps and addresses from actual
-transactions):
+Real StudioNet runs against `0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054`,
+this pass (all values and addresses from actual transactions):
 
-- **Full lifecycle** (deal 0): `create_deal` funded 1 GEN, 5/5 validators
-  AGREE; `accept_deal` with a 0.1 GEN bond, 5/5 AGREE; `submit_delivery_evidence`,
-  5/5 AGREE; `check_delivery_status` against `https://httpbin.org/status/200`,
-  classified `UNKNOWN` (a 200-status page with no delivery-status text —
-  correctly not coerced to DELIVERED); `resolve_condition` against
-  `picsum.photos` listing/delivery photos returned `UNDETERMINED` twice in a
-  row — see honest limits below — funds remained fully escrowed both times
-  (`price_deposited_wei` unchanged), exactly as designed.
-- **Condition adjudication with a direct (non-redirecting) image URL** (deal
-  1): resolved to a real banded verdict (`NOT_RECEIVED`, on that run) with
-  4/5 AGREE + 1 IDLE reaching quorum, then `finalize_deal` correctly zeroed
-  the escrow and routed the full price + bond to the buyer.
-- **Contest ladder** (deal 5): `resolve_condition` returned `MATCH` with
-  identical listing/delivery photos ("The buyer's delivery photo is an exact
-  visual match to the seller's listing photo..."); `contest_verdict` bonded
-  0.15 GEN (15% of a 1 GEN price, matching `CONTEST_BOND_BPS`); `resolve_contest`
-  re-ran adversarially, upheld the original `MATCH`, forfeited the contest
-  bond to the counterparty, and finalized to `FINALIZED_MATCH` — all in one
-  permissionless call.
-- **Timeout ladder**: `cancel_deal` (deal 2), `timeout_unaccepted_reclaim`
-  (deal 3), and `timeout_undelivered_reclaim` (deal 6, refunding both the
-  price and the seller's posted bond) all executed live and zeroed the
-  escrow ledger as designed.
-- Every deterministic write across all of the above reached **5/5 AGREE**
-  except one nondet round that reached quorum at 4 AGREE + 1 IDLE — both are
-  documented StudioNet behaviors, not faults.
+- **Full lifecycle up to a contested, finalized verdict** (deal 0):
+  `create_deal` funded 1 GEN, `accept_deal` posted a 0.1 GEN bond,
+  `submit_delivery_evidence`, `check_delivery_status` (classified `UNKNOWN`
+  against a plain 200-status page with no delivery text — correctly not
+  coerced to DELIVERED) all reached `ACCEPTED`. `resolve_condition` fetched
+  the listing/delivery photos (both `httpbin.org/image/jpeg` — a stock photo
+  of a jackal, not the described sofa) and correctly returned
+  `NOT_RECEIVED`, reasoning that the delivered image bore no resemblance to
+  the purchased item. The seller then called `contest_verdict` (bonding
+  exactly 0.15 GEN = 15% of the price, matching `CONTEST_BOND_BPS`), and
+  `resolve_contest` re-ran the adversarial adjudication, **upheld**
+  `NOT_RECEIVED`, forfeited the contest bond to the buyer, and finalized to
+  `FINALIZED_NOT_RECEIVED` — all with the exact-bucket-match `validator_fn`
+  live on-chain, not a mocked one.
+- **Convergence** (two independent deals, identical listing/delivery
+  photo): both resolved to `MATCH`, run 0 and run 1, confirming the
+  strict form of the convergence property live.
+- **Trusted-time enforcement, proven by genuinely waiting**:
+  `timeout_unaccepted_reclaim` was called only after the test process slept
+  until the real StudioNet clock actually passed `ship_by_ts` — there is no
+  parameter left to fake this with, so this run is direct evidence the fix
+  holds on the live network, not just in a warped direct-mode test.
+  `cancel_deal` was also exercised live (pre-acceptance refund path).
+- Every write call across all of the above reached `ACCEPTED` consensus.
 
 ## Errors encountered while writing and fixing this contract
 
@@ -440,7 +532,7 @@ either in the code or in how it was tested.
    rather than the image bytes directly. This is a genuine, still-open
    flakiness in how the evidence layer surfaces fetched bytes to the vision
    model when the source redirects — not a bug in this contract's own fetch
-   code, which is exercised and passing in 57 direct tests with mocked
+   code, which is exercised and passing in 58 direct tests with mocked
    image bytes, and which produced a correct, confident `MATCH` verdict
    live on StudioNet once pointed at a non-redirecting URL
    (`httpbin.org/image/jpeg`) — including one run that survived a full
@@ -476,11 +568,16 @@ either in the code or in how it was tested.
   GEN arriving in a plain wallet's spendable balance was not independently
   re-verified against a block explorer balance check in this pass — say so
   plainly rather than overclaim.
-- **`force_refund_undetermined` was not exercised live** in this pass (only
-  in direct tests) because forcing it requires 5 exhausted adjudication
-  attempts plus a 3-day grace window; the direct tests cover both the
-  "attempts not yet exhausted" revert and the successful refund path with a
-  mocked clock.
+- **`force_refund_undetermined`, `timeout_undelivered_reclaim`, and
+  `claim_via_tracking_confirmation` were not exercised live** in this pass
+  (only in direct tests with a warped clock) because each now genuinely
+  requires a real multi-day grace window to elapse on StudioNet — the
+  trusted-time fix means there is no longer any way to fake this for a
+  quick live demonstration. This is the correct trade-off (a spoofable
+  `now_ts` was exactly the vulnerability being fixed), but it does mean
+  these three paths' *live* evidence is currently limited to the
+  deterministic-write half (direct tests cover the full logic, including
+  both sides of every grace-window boundary).
 - **Reusing this primitive would be a mistake** for goods whose condition
   can't be meaningfully judged from a single photo pair (e.g., mechanical
   function, smell, structural integrity under load) — the equivalence

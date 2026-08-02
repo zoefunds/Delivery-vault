@@ -12,21 +12,19 @@ That's it. Everything else — thresholds, payout math, state transitions, acces
 
 Access control (buyer/seller/anyone-permissionless roles per method), all escrow arithmetic and bps math, every status transition, the mapping from a verdict band to a payout split, every timeout/deadline comparison, input validation, storage writes, event/activity logging, output sanitization (clamping, key normalization). The model is only ever asked "what does the evidence show" — never "who should get paid" or "what should happen now."
 
-## 3. Equivalence principles (full prose)
+## 3. Equivalence principles — revised after review (code-enforced, not LLM-judged)
 
-**Condition adjudication** uses `prompt_comparative` (never `prompt_non_comparative` — this decides a payout, so validators must independently re-derive the judgment, not just check the leader's output shape):
+**Original design (superseded):** both nondet operations used `gl.eq_principle.prompt_comparative` with a natural-language principle. A team review correctly flagged this for condition adjudication: the principle told the model that two `seller_payout_bps` values "within 1500 of each other" were equivalent, but the value actually written to storage and paid out was always just the leader's raw proposal — so the real settlement figure was only as trustworthy as an LLM's *interpretation* of a tolerance, never independently verified in code.
 
-> "Both results are JSON verdicts about whether a physical item's delivered condition matches its promised listing condition, based on the same listing photo and delivery photo. Treat them as equivalent if they agree on the 'band' value (MATCH, MINOR_DISCREPANCY, MAJOR_DISCREPANCY, or NOT_RECEIVED) AND, when the band is MINOR_DISCREPANCY, their 'seller_payout_bps' values are within 1500 (15 percentage points) of each other. Differences in wording of 'reasoning', which specific discrepancy is named first, formatting, or key order are irrelevant. A different band, or a materially different payout split, is NOT equivalent."
+**Current design:** both operations use `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)`, where `validator_fn` is plain Python, not a prose principle:
 
-Numeric output is banded (a coarse enum plus a bps split rounded to the nearest 500 by the contract before comparison) rather than a raw float, so validators compare a category, not a float — this is the "confidence HIGH not 0.83" pattern.
+- **Condition adjudication** (`_adjudicate_condition_nondet`): `validator_fn` requires the `band` to match the leader's exactly, and — only when `band == MINOR_DISCREPANCY` — requires `seller_payout_bps` (already rounded to the nearest 500 by `_parse_condition_verdict` before comparison) to match the leader's exactly. Two independent runs either land in the same discrete bucket or they don't; there is no numeric "close enough" left in the path that decides how much money moves.
+- **Delivery-confirmation fetch** (`_check_tracking_nondet`): `validator_fn` requires the classified `status` (DELIVERED / IN_TRANSIT / EXCEPTION / UNKNOWN) to match the leader's exactly. This also gates a full payout (`claim_via_tracking_confirmation`), so it gets the same code-enforced treatment even though the old principle was already effectively binary here.
+- **Contest re-adjudication** reuses `_adjudicate_condition_nondet` verbatim (same code-enforced equivalence) with a distinct adversarial prompt that explicitly instructs the model to look for reasons the first verdict might be wrong, so a contest is a genuine second opinion, not degenerate re-confirmation.
 
-**Delivery-confirmation fetch** uses `prompt_comparative`:
+Leader-error handling (`_handle_nondet_leader_error`) still classifies by prefix: deterministic errors must match exactly, transient errors agree if both sides are transient, and LLM/unknown errors force disagreement so consensus rotates the leader rather than persisting garbage.
 
-> "Both results are JSON classifications of the same carrier tracking page into exactly one of DELIVERED, IN_TRANSIT, EXCEPTION, or UNKNOWN. Treat them as equivalent if and only if they name the same status. Reasoning wording is irrelevant."
-
-**Contest re-adjudication** reuses the condition-adjudication principle verbatim (same equivalence rule — a contest still resolves to one of the same four bands) but leader/validators run a distinct adversarial prompt that explicitly instructs the model to look for reasons the first verdict might be wrong, so a contest is not degenerate re-confirmation of the same reasoning path.
-
-`strict_eq` is not used anywhere — nothing in this contract produces byte-identical output validators could reproduce deterministically; every nondet block ends in a model judgment.
+Numeric output is still banded (a coarse enum plus a bps split rounded to the nearest 500) rather than a raw float — this is the "confidence HIGH not 0.83" pattern — but the comparison against that bucket is now a Python `==`, not an LLM's judgment call. `strict_eq` is still not used anywhere: nothing here produces byte-identical raw model text across independent calls; the exactness is enforced on the normalized, bucketed decision fields instead.
 
 ## 4. Failure and abstention semantics
 

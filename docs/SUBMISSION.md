@@ -19,7 +19,7 @@ counterparty.
 
 Escrow ledger fields are zeroed before every transfer
 (checks-effects-interactions), so double-spend is structurally impossible
--- verified in 57 direct tests. Live on StudioNet: a contested deal
+-- verified in 58 direct tests. Live on StudioNet: a contested deal
 converged on MATCH twice (identical photos), upheld on re-adjudication, and
 paid out correctly in one permissionless call.
 
@@ -27,9 +27,9 @@ Character count verified with `python3 -c "print(len(open('notes.txt').read().st
 
 ## Evidence links
 
-- GitHub repo: (push this repo and add the URL here before submitting)
-- Deployed contract (StudioNet): `0xd661bea0F9796CA39d8bA4BBe5cF09E7C7138758`
-- Explorer: https://genlayer-explorer.vercel.app/contracts/0xd661bea0F9796CA39d8bA4BBe5cF09E7C7138758
+- GitHub repo: https://github.com/zoefunds/Delivery-vault
+- Deployed contract (StudioNet): `0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054`
+- Explorer: https://genlayer-explorer.vercel.app/contracts/0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054
 - Studio import: use the address above with "Import contract" in GenLayer Studio pointed at StudioNet.
 
 ## Git hygiene

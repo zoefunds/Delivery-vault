@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from genlayer import *
 
 
-VAULT_ADDRESS = "0xd661bea0F9796CA39d8bA4BBe5cF09E7C7138758"  # StudioNet deployment
+VAULT_ADDRESS = "0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054"  # StudioNet deployment
 
 
 @gl.contract_interface
@@ -33,10 +33,9 @@ class DeliveryVault:
             tracking_url: str,
             ship_by_ts: int,
             deliver_by_ts: int,
-            now_ts: int,
         ) -> int: ...
 
-        def accept_deal(self, deal_id: int, now_ts: int) -> None: ...
+        def accept_deal(self, deal_id: int) -> None: ...
 
 
 @allow_storage
@@ -82,7 +81,6 @@ class MarketplaceBoard(gl.Contract):
         tracking_url: str,
         ship_by_ts: int,
         deliver_by_ts: int,
-        now_ts: int,
     ) -> None:
         """Fund escrow for a listing through the vault. Any GEN attached
         here is forwarded as the vault's escrowed price on finalization - the
@@ -106,7 +104,6 @@ class MarketplaceBoard(gl.Contract):
             tracking_url,
             ship_by_ts,
             deliver_by_ts,
-            now_ts,
         )
         listing.has_deal = True
 
