@@ -5,3 +5,4 @@ artifacts/
 .keys/
 .env
 .last_deploy_address
+.venv/

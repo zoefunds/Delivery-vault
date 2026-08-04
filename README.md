@@ -255,11 +255,14 @@ The pattern throughout: **any call that could bias who gets paid is restricted t
 
 ## Fixes made in response to external review
 
-A team review of the first submission raised two findings. Both are fixed,
-not just documented around. **See [docs/REVIEW.md](docs/REVIEW.md) for the
-full walkthrough** — the verbatim review comment, before/after code for
-both fixes, why each was wrong, and exactly how each was verified. The
-summary:
+Two rounds of team review, three findings total, all fixed — not just
+documented around.
+
+### Round 1
+
+**See [docs/REVIEW.md](docs/REVIEW.md) for the full walkthrough** — the
+verbatim review comment, before/after code for both fixes, why each was
+wrong, and exactly how each was verified. The summary:
 
 1. **"The escrow payout is not fully bound by validator consensus: two
    minor-discrepancy results up to 1,500 basis points apart are treated as
@@ -299,6 +302,41 @@ and a full contest round (`contest_verdict` → `resolve_contest`) reached
 consensus on an exact settlement bucket with no LLM-judged tolerance
 involved anywhere in the path. See
 [Measured on live consensus](#measured-on-live-consensus).
+
+### Round 2
+
+**See [docs/REVIEW2.md](docs/REVIEW2.md) for the full walkthrough.** A
+second review found one more gap in the same `validator_fn` mechanism round
+1 introduced:
+
+3. **"The custom validators do not always independently verify the result
+   that moves funds. If the leader returns a condition or tracking verdict
+   while a validator's rerun hits a transient fetch error, the validator
+   currently approves without comparing the condition band, payout bucket,
+   or tracking status."** Confirmed and fixed. When the leader succeeded but
+   a validator's own independent rerun of the identical fetch-and-judge task
+   raised a `TRANSIENT`-prefixed error, the old code returned
+   `msg.startswith(ERR_TRANSIENT)` — `True` — approving the leader's verdict
+   without ever running the field-by-field comparison. A validator that
+   never fetched its own evidence, never ran its own judgment, and never
+   compared `band`, `seller_payout_bps`, or `tracking_status` was still
+   counted as independent agreement on a call that moves the full escrowed
+   price and bond. Fixed in both `_adjudicate_condition_nondet.validator_fn`
+   and `_check_tracking_nondet.validator_fn`: any exception on the
+   validator's own rerun — transient or not — now returns `False`
+   (disagree), since a validator that can't reproduce the result has nothing
+   to compare against and must not vote agree. The leader-failure branch
+   (`_handle_nondet_leader_error`) and the exact-match comparison logic
+   itself were already correct and are unchanged; see
+   [docs/REVIEW2.md](docs/REVIEW2.md) for the full before/after.
+
+Verified live against a freshly redeployed contract
+(`0x43d4a534E9761D2CC359b2D6e5af1d6D6Bf8602d`), whose deployed source was
+diffed against local source before any calls were made to confirm the fix
+was genuinely live. All 15 exercisable methods — including a full
+`resolve_condition` → `contest_verdict` → `resolve_contest` round, the exact
+path that runs the fixed `validator_fn` — reached `ACCEPTED` consensus with
+zero errors. See [Measured on live consensus](#measured-on-live-consensus).
 
 ## Safety properties (each backed by a named test)
 
@@ -484,9 +522,14 @@ StudioNet is gasless, so any account works with a zero or nonzero balance.
   and boundary cases, including a dedicated test confirming a spoofed
   `now_ts` can no longer be passed at all
   (`test_create_deal_uses_trusted_clock_not_a_caller_argument`).
-- Redeployed on StudioNet after the review fixes:
-  `0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054`
-  ([explorer](https://genlayer-explorer.vercel.app/contracts/0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054))
+- Redeployed on StudioNet after the round-2 review fix:
+  **`0x43d4a534E9761D2CC359b2D6e5af1d6D6Bf8602d`**
+  ([explorer](https://genlayer-explorer.vercel.app/contracts/0x43d4a534E9761D2CC359b2D6e5af1d6D6Bf8602d))
+  — supersedes the round-1 address
+  (`0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054`). Deployed source was
+  diffed against local source (`genlayer code <address>`) before any live
+  calls were made, confirming the round-2 fix is genuinely the code
+  running on-chain.
 - Every write method except `claim_via_tracking_confirmation`,
   `timeout_undelivered_reclaim`, and `force_refund_undetermined` has been
   executed against this redeployed address (see below). Those three are
@@ -497,8 +540,9 @@ StudioNet is gasless, so any account works with a zero or nonzero balance.
 
 ## Measured on live consensus
 
-Real StudioNet runs against `0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054`,
-this pass (all values and addresses from actual transactions):
+Real StudioNet runs against `0x43d4a534E9761D2CC359b2D6e5af1d6D6Bf8602d`
+(the round-2 redeployment), this pass (all values and addresses from actual
+transactions):
 
 - **Full lifecycle up to a contested, finalized verdict** (deal 0):
   `create_deal` funded 1 GEN, `accept_deal` posted a 0.1 GEN bond,
@@ -507,23 +551,28 @@ this pass (all values and addresses from actual transactions):
   coerced to DELIVERED) all reached `ACCEPTED`. `resolve_condition` fetched
   the listing/delivery photos (both `httpbin.org/image/jpeg` — a stock photo
   of a jackal, not the described sofa) and correctly returned
-  `NOT_RECEIVED`, reasoning that the delivered image bore no resemblance to
-  the purchased item. The seller then called `contest_verdict` (bonding
-  exactly 0.15 GEN = 15% of the price, matching `CONTEST_BOND_BPS`), and
+  `NOT_RECEIVED`, reasoning that no meaningful delivery image was available
+  to evaluate. The seller then called `contest_verdict` (bonding exactly
+  0.15 GEN = 15% of the price, matching `CONTEST_BOND_BPS`), and
   `resolve_contest` re-ran the adversarial adjudication, **upheld**
   `NOT_RECEIVED`, forfeited the contest bond to the buyer, and finalized to
-  `FINALIZED_NOT_RECEIVED` — all with the exact-bucket-match `validator_fn`
-  live on-chain, not a mocked one.
-- **Convergence** (two independent deals, identical listing/delivery
-  photo): both resolved to `MATCH`, run 0 and run 1, confirming the
-  strict form of the convergence property live.
+  `FINALIZED_NOT_RECEIVED` — all with the fixed, code-enforced
+  `validator_fn` (round-2 fix) live on-chain, not a mocked one.
+- **`cancel_deal`** (deal 1): buyer funded 1 GEN and cancelled
+  pre-acceptance; full refund, `price_deposited_wei` zeroed, status
+  `CANCELLED`.
 - **Trusted-time enforcement, proven by genuinely waiting**:
-  `timeout_unaccepted_reclaim` was called only after the test process slept
-  until the real StudioNet clock actually passed `ship_by_ts` — there is no
-  parameter left to fake this with, so this run is direct evidence the fix
-  holds on the live network, not just in a warped direct-mode test.
-  `cancel_deal` was also exercised live (pre-acceptance refund path).
-- Every write call across all of the above reached `ACCEPTED` consensus.
+  `timeout_unaccepted_reclaim` (deal 2) was called only after the test
+  process slept until the real StudioNet clock actually passed
+  `ship_by_ts` — there is no parameter left to fake this with, so this run
+  is direct evidence the round-1 trusted-clock fix still holds on the
+  redeployed contract.
+- Every view method (`get_config`, `get_platform_stats`, `get_deal_count`,
+  `get_deal_summary`, `get_activity`, `get_party_deal_ids`) was also called
+  live against the new address and returned consistent state.
+- Every write call across all of the above reached `ACCEPTED` consensus —
+  **15 of 15 exercised methods, zero errors.** Final platform stats after
+  this pass: 3 deals, 1 finalized, 1 contest, 3 GEN total volume.
 
 ## Errors encountered while writing and fixing this contract
 

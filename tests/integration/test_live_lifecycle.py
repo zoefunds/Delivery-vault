@@ -22,7 +22,7 @@ from eth_account import Account
 from gltest.contracts import get_contract_factory
 from gltest.assertions import tx_execution_failed
 
-CONTRACT_ADDRESS = "0x6C8b6928EeFE8121A4A9265d74f86EEe55C1C054"
+CONTRACT_ADDRESS = "0x43d4a534E9761D2CC359b2D6e5af1d6D6Bf8602d"
 KEYS_DIR = Path(__file__).parent.parent.parent / ".keys"
 GEN = 10**18
 PASSWORD = "testpass123"

@@ -1,4 +1,4 @@
-# v0.2.16
+# v0.2.17
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 import datetime
@@ -605,9 +605,13 @@ Return ONLY a JSON object exactly like:
                 return False
             try:
                 mine = leader_fn()
-            except gl.vm.UserError as exc:
-                msg = getattr(exc, "message", None) or str(exc)
-                return msg.startswith(ERR_TRANSIENT)
+            except gl.vm.UserError:
+                # The leader returned a concrete verdict; if this validator's
+                # own independent rerun can't reproduce ANY result (transient
+                # or otherwise), it has nothing to compare the band/bps
+                # against, so it must disagree rather than rubber-stamp a
+                # verdict it never actually verified.
+                return False
             except Exception:
                 return False
 
@@ -702,9 +706,12 @@ Return ONLY a JSON object exactly like:
                 return False
             try:
                 mine = leader_fn()
-            except gl.vm.UserError as exc:
-                msg = getattr(exc, "message", None) or str(exc)
-                return msg.startswith(ERR_TRANSIENT)
+            except gl.vm.UserError:
+                # Same reasoning as the condition validator: a transient
+                # failure on our own rerun means we never independently
+                # reproduced the tracking status, so we cannot agree with a
+                # leader-reported DELIVERED/EXCEPTION/etc. verdict.
+                return False
             except Exception:
                 return False
             leader_status = str(leader_out.get("status", ""))
